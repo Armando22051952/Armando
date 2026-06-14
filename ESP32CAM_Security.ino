@@ -2,21 +2,28 @@
  * ESP32-CAM Security System with AI-Thinker ESP32-CAM
  * Features:
  * - PIR Motion Detection
- * - Photo Capture with Timestamp (RTC)
+ * - Photo Capture with Timestamp (RTC via NTP)
  * - Storage on SPIFFS (Internal Flash)
- * - Email Notification with Photo Attachment
+ * - Email Notification with Photo Attachment (SMTP)
+ * 
+ * Libraries Required (Built-in Arduino):
+ * - WiFi.h
+ * - SPIFFS.h
+ * - time.h
+ * - esp_camera.h
+ * - WiFiClientSecure.h
  */
 
 #include "esp_camera.h"
 #include "SPIFFS.h"
 #include "WiFi.h"
+#include "WiFiClientSecure.h"
 #include "time.h"
-#include "esp_mail_client.h"
+#include <string.h>
+#include <stdlib.h>
 
 // ==================== PIN DEFINITIONS ====================
 #define PIR_SENSOR_PIN    13  // GPIO13 - PIR Motion Sensor
-#define RTC_SDA_PIN       14  // GPIO14 - RTC I2C SDA
-#define RTC_SCL_PIN       15  // GPIO15 - RTC I2C SCL
 #define LED_FLASH         4   // GPIO4 - LED Flash
 
 // ==================== CAMERA PINS (AI-Thinker ESP32-CAM) ====================
@@ -40,25 +47,174 @@
 // ==================== WiFi & Email Configuration ====================
 const char* ssid = "YOUR_SSID";
 const char* password = "YOUR_PASSWORD";
-
-#define SMTP_HOST "smtp.gmail.com"
-#define SMTP_PORT 465
-#define SENDER_EMAIL "your_email@gmail.com"
-#define SENDER_PASSWORD "your_app_password"  // Gmail App Password
-#define RECIPIENT_EMAIL "recipient@example.com"
-
-// ==================== EMAIL CLIENT ====================
-SMTPSession smtp;
-ESP_Mail_Session session;
+const char* smtp_host = "smtp.gmail.com";
+const int smtp_port = 465;
+const char* sender_email = "your_email@gmail.com";
+const char* sender_password = "your_app_password";  // Gmail App Password
+const char* recipient_email = "recipient@example.com";
 
 // ==================== GLOBAL VARIABLES ====================
 bool motionDetected = false;
 unsigned long lastCaptureTime = 0;
 const unsigned long CAPTURE_INTERVAL = 10000; // 10 seconds between captures
-
-// Simple RTC Variables (using system time synchronized via NTP)
 struct tm timeinfo;
-time_t now;
+
+// ==================== BASE64 ENCODING ====================
+const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+String base64Encode(uint8_t* data, size_t len) {
+  String result = "";
+  int i = 0;
+  
+  while (i < len) {
+    uint8_t b1 = data[i++];
+    uint8_t b2 = (i < len) ? data[i++] : 0;
+    uint8_t b3 = (i < len) ? data[i++] : 0;
+    
+    uint32_t combined = (b1 << 16) | (b2 << 8) | b3;
+    
+    result += base64_table[(combined >> 18) & 0x3F];
+    result += base64_table[(combined >> 12) & 0x3F];
+    result += (i - 1 < len) ? base64_table[(combined >> 6) & 0x3F] : '=';
+    result += (i < len) ? base64_table[combined & 0x3F] : '=';
+  }
+  
+  return result;
+}
+
+// ==================== SMTP CLIENT (NATIVE IMPLEMENTATION) ====================
+class SimpleSMTPClient {
+  private:
+    WiFiClientSecure client;
+    String response;
+    
+  public:
+    bool connect(const char* host, int port) {
+      Serial.printf("Connecting to SMTP server: %s:%d\n", host, port);
+      return client.connect(host, port);
+    }
+    
+    String readResponse() {
+      response = "";
+      while (client.available()) {
+        char c = client.read();
+        response += c;
+      }
+      Serial.print(response);
+      return response;
+    }
+    
+    void sendCommand(const String& cmd) {
+      Serial.printf(">>> %s\n", cmd.c_str());
+      client.println(cmd);
+      delay(100);
+      readResponse();
+    }
+    
+    bool authenticate(const char* email, const char* password) {
+      // Send EHLO
+      sendCommand("EHLO esp32");
+      
+      // Start TLS
+      sendCommand("STARTTLS");
+      
+      // Upgrade connection to TLS
+      if (!client.startSSL()) {
+        Serial.println("Failed to upgrade to TLS");
+        return false;
+      }
+      
+      delay(500);
+      readResponse();
+      
+      // Send EHLO again after TLS
+      sendCommand("EHLO esp32");
+      
+      // Authenticate with base64 encoded credentials
+      sendCommand("AUTH LOGIN");
+      
+      String encodedEmail = base64Encode((uint8_t*)email, strlen(email));
+      sendCommand(encodedEmail);
+      
+      String encodedPassword = base64Encode((uint8_t*)password, strlen(password));
+      sendCommand(encodedPassword);
+      
+      return true;
+    }
+    
+    void sendMail(const char* from, const char* to, const char* subject, 
+                  const char* bodyText, const char* filename, uint8_t* imageData, size_t imageSize) {
+      
+      // MAIL FROM
+      String mailFrom = "MAIL FROM:<";
+      mailFrom += from;
+      mailFrom += ">";
+      sendCommand(mailFrom);
+      
+      // RCPT TO
+      String rcptTo = "RCPT TO:<";
+      rcptTo += to;
+      rcptTo += ">";
+      sendCommand(rcptTo);
+      
+      // DATA
+      sendCommand("DATA");
+      
+      // Prepare email headers and body
+      String headers = "From: ";
+      headers += from;
+      headers += "\r\nTo: ";
+      headers += to;
+      headers += "\r\nSubject: ";
+      headers += subject;
+      headers += "\r\nMIME-Version: 1.0\r\n";
+      headers += "Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\r\n";
+      
+      client.print(headers);
+      
+      // Text part
+      client.print("--boundary123\r\n");
+      client.print("Content-Type: text/html; charset=\"UTF-8\"\r\n");
+      client.print("Content-Transfer-Encoding: 7bit\r\n\r\n");
+      client.print(bodyText);
+      client.print("\r\n\r\n");
+      
+      // Image attachment
+      client.print("--boundary123\r\n");
+      client.print("Content-Type: image/jpeg\r\n");
+      client.print("Content-Transfer-Encoding: base64\r\n");
+      client.printf("Content-Disposition: attachment; filename=\"%s\"\r\n\r\n", filename);
+      
+      String encodedImage = base64Encode(imageData, imageSize);
+      
+      // Send base64 image in chunks
+      const int chunkSize = 76;
+      for (int i = 0; i < encodedImage.length(); i += chunkSize) {
+        client.println(encodedImage.substring(i, i + chunkSize));
+      }
+      
+      client.print("\r\n--boundary123--\r\n");
+      
+      // End of DATA
+      sendCommand(".");
+      
+      delay(500);
+      readResponse();
+    }
+    
+    void quit() {
+      sendCommand("QUIT");
+      client.stop();
+    }
+    
+    void close() {
+      if (client.connected()) {
+        client.stop();
+      }
+    }
+};
+
+SimpleSMTPClient smtpClient;
 
 // ==================== FUNCTION PROTOTYPES ====================
 void initCamera();
@@ -69,7 +225,6 @@ void configureRTC();
 void captureAndSavePhoto();
 void sendEmailWithPhoto(const char* imagePath);
 void getFormattedDateTime(char* buffer);
-String getEpochTimestamp();
 
 // ==================== SETUP ====================
 void setup() {
@@ -235,6 +390,13 @@ void configureRTC() {
   Serial.println(asctime(&timeinfo));
 }
 
+// ==================== GET FORMATTED DATE & TIME ====================
+void getFormattedDateTime(char* buffer) {
+  time_t now = time(nullptr);
+  localtime_r(&now, &timeinfo);
+  strftime(buffer, 64, "%d/%m/%Y %H:%M:%S", &timeinfo);
+}
+
 // ==================== CAPTURE AND SAVE PHOTO ====================
 void captureAndSavePhoto() {
   digitalWrite(LED_FLASH, HIGH);  // Turn on flash
@@ -271,28 +433,15 @@ void captureAndSavePhoto() {
   
   Serial.printf("Photo saved: %s (Size: %d bytes)\n", filename, fb->len);
   
+  // Store image data for email
+  uint8_t* imageData = fb->buf;
+  size_t imageSize = fb->len;
+  
   esp_camera_fb_return(fb);
   digitalWrite(LED_FLASH, LOW);
   
   // Send email with photo
   sendEmailWithPhoto(filename);
-}
-
-// ==================== GET FORMATTED DATE & TIME ====================
-void getFormattedDateTime(char* buffer) {
-  time_t now = time(nullptr);
-  localtime_r(&now, &timeinfo);
-  strftime(buffer, 64, "%d/%m/%Y %H:%M:%S", &timeinfo);
-}
-
-// ==================== GET EPOCH TIMESTAMP ====================
-String getEpochTimestamp() {
-  time_t now = time(nullptr);
-  localtime_r(&now, &timeinfo);
-  
-  char timestamp[20];
-  strftime(timestamp, sizeof(timestamp), "%d%m%Y%H%M%S", &timeinfo);
-  return String(timestamp);
 }
 
 // ==================== SEND EMAIL WITH PHOTO ====================
@@ -304,70 +453,67 @@ void sendEmailWithPhoto(const char* imagePath) {
   
   Serial.println("Preparing to send email...");
   
-  // Configure session
-  session.server.host_name = SMTP_HOST;
-  session.server.port = SMTP_PORT;
-  session.login.email = SENDER_EMAIL;
-  session.login.password = SENDER_PASSWORD;
-  session.login.user_domain = "";
-  
-  // Declare the object for sending Email
-  SMTP_Message message;
-  
-  message.sender.name = "ESP32-CAM Security";
-  message.sender.email = SENDER_EMAIL;
-  message.subject = "Motion Detected - Security Alert";
-  message.addRecipient("User", RECIPIENT_EMAIL);
-  
-  // Prepare message body
-  char dateTime[64];
-  getFormattedDateTime(dateTime);
-  
-  String htmlMsg = "<html><body>";
-  htmlMsg += "<h2>Motion Detection Alert</h2>";
-  htmlMsg += "<p><strong>Date & Time:</strong> ";
-  htmlMsg += dateTime;
-  htmlMsg += "</p>";
-  htmlMsg += "<p><strong>Location:</strong> Main Entrance</p>";
-  htmlMsg += "<p>A motion has been detected by the ESP32-CAM security system.</p>";
-  htmlMsg += "<p>Please see the attached photo for details.</p>";
-  htmlMsg += "</body></html>";
-  
-  message.html.content = htmlMsg.c_str();
-  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
-  
-  // Add photo attachment
-  SMTP_Attachment attachment;
-  attachment.descr.filename = imagePath;
-  attachment.descr.mime = "image/jpeg";
-  attachment.file.path = imagePath;
-  attachment.file.storage_type = esp_mail_file_storage_type_spiffs;
-  message.addAttachment(attachment);
-  
-  // Connect to server and send Email
-  if (!smtp.connect(&session)) {
-    Serial.printf("SMTP connection error: %s\n", smtp.errorReason().c_str());
+  // Read image from SPIFFS
+  File imageFile = SPIFFS.open(imagePath, FILE_READ);
+  if (!imageFile) {
+    Serial.println("Failed to open image file");
     return;
   }
   
-  if (!MailClient.sendEmail(&smtp, &message)) {
-    Serial.printf("Error sending Email: %s\n", smtp.errorReason().c_str());
-  } else {
-    Serial.println("Email sent successfully!");
+  size_t imageSize = imageFile.size();
+  uint8_t* imageData = (uint8_t*)malloc(imageSize);
+  
+  if (!imageData) {
+    Serial.println("Failed to allocate memory for image");
+    imageFile.close();
+    return;
   }
   
-  // Disconnect
-  smtp.closeSession();
-}
-
-// ==================== UTILITY: List Files in SPIFFS ====================
-void listSPIFFSFiles() {
-  File root = SPIFFS.open("/");
-  File file = root.openNextFile();
+  imageFile.read(imageData, imageSize);
+  imageFile.close();
   
-  Serial.println("Files in SPIFFS:");
-  while (file) {
-    Serial.printf("  %s (%d bytes)\n", file.name(), file.size());
-    file = root.openNextFile();
+  // Disable SSL verification (not recommended for production)
+  smtpClient.client.setInsecure();
+  
+  // Connect to SMTP server
+  if (!smtpClient.connect(smtp_host, smtp_port)) {
+    Serial.println("Failed to connect to SMTP server");
+    free(imageData);
+    return;
   }
+  
+  delay(500);
+  smtpClient.readResponse();
+  
+  // Authenticate
+  if (!smtpClient.authenticate(sender_email, sender_password)) {
+    Serial.println("SMTP authentication failed");
+    smtpClient.close();
+    free(imageData);
+    return;
+  }
+  
+  // Prepare email body
+  char dateTime[64];
+  getFormattedDateTime(dateTime);
+  
+  String htmlBody = "<html><body>";
+  htmlBody += "<h2>Motion Detection Alert</h2>";
+  htmlBody += "<p><strong>Date &amp; Time:</strong> ";
+  htmlBody += dateTime;
+  htmlBody += "</p>";
+  htmlBody += "<p><strong>Location:</strong> Main Entrance</p>";
+  htmlBody += "<p>A motion has been detected by the ESP32-CAM security system.</p>";
+  htmlBody += "<p>Please see the attached photo for details.</p>";
+  htmlBody += "</body></html>";
+  
+  // Send email
+  smtpClient.sendMail(sender_email, recipient_email, "Motion Detected - Security Alert",
+                      htmlBody.c_str(), imagePath, imageData, imageSize);
+  
+  // Cleanup
+  smtpClient.quit();
+  free(imageData);
+  
+  Serial.println("Email sending completed!");
 }
